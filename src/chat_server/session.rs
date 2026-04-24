@@ -9,6 +9,7 @@ use super::server::ChatServer;
 
 pub struct ChatSession {
     pub user_id: Uuid,
+    pub connection_id: Uuid,
     pub server_addr: Addr<ChatServer>,
     pub initial_rooms: Vec<String>,
 }
@@ -73,6 +74,7 @@ impl Actor for ChatSession {
 
         self.server_addr.do_send(Connect {
             user_id: self.user_id,
+            connection_id: self.connection_id,
             addr: addr.recipient(),
         });
 
@@ -96,6 +98,7 @@ impl Actor for ChatSession {
     fn stopped(&mut self, _: &mut Self::Context) {
         self.server_addr.do_send(Disconnect {
             user_id: self.user_id,
+            connection_id: self.connection_id,
         });
     }
 }

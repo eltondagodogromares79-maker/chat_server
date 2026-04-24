@@ -62,6 +62,7 @@ impl std::fmt::Display for MessageKind {
 #[rtype(result = "()")]
 pub struct Connect {
     pub user_id: Uuid,
+    pub connection_id: Uuid,
     pub addr: Recipient<ServerMessage>,
 }
 
@@ -69,6 +70,7 @@ pub struct Connect {
 #[rtype(result = "()")]
 pub struct Disconnect {
     pub user_id: Uuid,
+    pub connection_id: Uuid,
 }
 
 #[derive(Message)]
@@ -164,4 +166,11 @@ pub struct ServerMessage(pub String);
 pub struct ErrorMessage {
     pub user_id: Uuid,
     pub error: String,
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct InternalNotificationEvent {
+    pub user_id: Uuid,
+    pub payload: String,
 }

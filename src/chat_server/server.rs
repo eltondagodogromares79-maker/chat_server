@@ -16,7 +16,7 @@ use super::persist::{
 use serde::Deserialize;
 
 pub struct ChatServer {
-    pub sessions: HashMap<Uuid, Recipient<ServerMessage>>,
+    pub sessions: HashMap<Uuid, HashMap<Uuid, Recipient<ServerMessage>>>,
     pub rooms: HashMap<String, HashSet<Uuid>>,
     pub django_base_url: String,
     pub chat_server_token: String,
@@ -73,6 +73,14 @@ impl ChatServer {
             entry.insert(*member);
         }
     }
+
+    fn send_to_user(&self, user_id: &Uuid, payload: &str) {
+        if let Some(recipients) = self.sessions.get(user_id) {
+            for recipient in recipients.values() {
+                recipient.do_send(ServerMessage(payload.to_string()));
+            }
+        }
+    }
 }
 
 impl Actor for ChatServer {
@@ -84,7 +92,10 @@ impl Handler<Connect> for ChatServer {
 
     fn handle(&mut self, msg: Connect, _: &mut Context<Self>) {
         println!("User connected: {}", msg.user_id);
-        self.sessions.insert(msg.user_id, msg.addr);
+        self.sessions
+            .entry(msg.user_id)
+            .or_default()
+            .insert(msg.connection_id, msg.addr);
         self.broadcast_presence();
     }
 }
@@ -94,10 +105,21 @@ impl Handler<Disconnect> for ChatServer {
 
     fn handle(&mut self, msg: Disconnect, _: &mut Context<Self>) {
         println!("User disconnected: {}", msg.user_id);
-        self.sessions.remove(&msg.user_id);
+        let should_remove = if let Some(connections) = self.sessions.get_mut(&msg.user_id) {
+            connections.remove(&msg.connection_id);
+            connections.is_empty()
+        } else {
+            false
+        };
 
-        for members in self.rooms.values_mut() {
-            members.remove(&msg.user_id);
+        if should_remove {
+            self.sessions.remove(&msg.user_id);
+        }
+
+        if !self.sessions.contains_key(&msg.user_id) {
+            for members in self.rooms.values_mut() {
+                members.remove(&msg.user_id);
+            }
         }
         self.broadcast_presence();
     }
@@ -167,19 +189,21 @@ impl Handler<DirectMessage> for ChatServer {
                 .unwrap_or_default();
 
             for user_id in room_members {
-                if let Some(recipient) = sessions.get(&user_id) {
-                    recipient.do_send(ServerMessage(format!(
-                        "{{\"type\":\"direct\",\"room\":\"{}\",\"from\":\"{}\",\"content\":\"{}\",\"kind\":\"{}\",\"sent_at\":\"{}\",\"message_id\":\"{}\"{}{}{} }}",
-                        room_clone,
-                        from,
-                        content.replace('"', "\\\""),
-                        kind,
-                        sent_at,
-                        message_id,
-                        reply_id_part,
-                        reply_content_part,
-                        reply_sender_part
-                    )));
+                if let Some(recipients) = sessions.get(&user_id) {
+                    for recipient in recipients.values() {
+                        recipient.do_send(ServerMessage(format!(
+                            "{{\"type\":\"direct\",\"room\":\"{}\",\"from\":\"{}\",\"content\":\"{}\",\"kind\":\"{}\",\"sent_at\":\"{}\",\"message_id\":\"{}\"{}{}{} }}",
+                            room_clone,
+                            from,
+                            content.replace('"', "\\\""),
+                            kind,
+                            sent_at,
+                            message_id,
+                            reply_id_part,
+                            reply_content_part,
+                            reply_sender_part
+                        )));
+                    }
                 }
             }
         });
@@ -252,31 +276,32 @@ impl Handler<GroupMessage> for ChatServer {
                 .unwrap_or_default();
 
             for user_id in room_members {
-                if let Some(recipient) = sessions.get(&user_id) {
-                    recipient.do_send(ServerMessage(format!(
-                        "{{\"type\":\"group\",\"room\":\"{}\",\"from\":\"{}\",\"content\":\"{}\",\"kind\":\"{}\",\"sent_at\":\"{}\",\"message_id\":\"{}\"{}{}{} }}",
-                        room_clone,
-                        from,
-                        content.replace('"', "\\\""),
-                        kind,
-                        sent_at,
-                        message_id,
-                        reply_id_part,
-                        reply_content_part,
-                        reply_sender_part
-                    )));
+                if let Some(recipients) = sessions.get(&user_id) {
+                    for recipient in recipients.values() {
+                        recipient.do_send(ServerMessage(format!(
+                            "{{\"type\":\"group\",\"room\":\"{}\",\"from\":\"{}\",\"content\":\"{}\",\"kind\":\"{}\",\"sent_at\":\"{}\",\"message_id\":\"{}\"{}{}{} }}",
+                            room_clone,
+                            from,
+                            content.replace('"', "\\\""),
+                            kind,
+                            sent_at,
+                            message_id,
+                            reply_id_part,
+                            reply_content_part,
+                            reply_sender_part
+                        )));
+                    }
                 }
             }
         });
 
         if !self.rooms.contains_key(&msg.room) {
             // Notify sender that room does not exist
-            if let Some(sender) = self.sessions.get(&msg.from) {
-                sender.do_send(ServerMessage(format!(
-                    "{{\"type\":\"error\",\"code\":\"ROOM_NOT_FOUND\",\"message\":\"Room {} does not exist or you have not joined it\"}}",
-                    msg.room
-                )));
-            }
+            let payload = format!(
+                "{{\"type\":\"error\",\"code\":\"ROOM_NOT_FOUND\",\"message\":\"Room {} does not exist or you have not joined it\"}}",
+                msg.room
+            );
+            self.send_to_user(&msg.from, &payload);
         }
     }
 }
@@ -316,12 +341,11 @@ impl Handler<TypingEvent> for ChatServer {
                 if *user_id == msg.user_id {
                     continue;
                 }
-                if let Some(recipient) = self.sessions.get(user_id) {
-                    recipient.do_send(ServerMessage(format!(
-                        "{{\"type\":\"typing\",\"room\":\"{}\",\"user_id\":\"{}\",\"is_typing\":{}}}",
-                        msg.room, msg.user_id, msg.is_typing
-                    )));
-                }
+                let payload = format!(
+                    "{{\"type\":\"typing\",\"room\":\"{}\",\"user_id\":\"{}\",\"is_typing\":{}}}",
+                    msg.room, msg.user_id, msg.is_typing
+                );
+                self.send_to_user(user_id, &payload);
             }
         }
     }
@@ -342,12 +366,11 @@ impl Handler<ReadEvent> for ChatServer {
                 if *user_id == msg.user_id {
                     continue;
                 }
-                if let Some(recipient) = self.sessions.get(user_id) {
-                    recipient.do_send(ServerMessage(format!(
-                        "{{\"type\":\"read\",\"room\":\"{}\",\"user_id\":\"{}\",\"last_read_at\":\"{}\"}}",
-                        msg.room, msg.user_id, msg.last_read_at.to_rfc3339()
-                    )));
-                }
+                let payload = format!(
+                    "{{\"type\":\"read\",\"room\":\"{}\",\"user_id\":\"{}\",\"last_read_at\":\"{}\"}}",
+                    msg.room, msg.user_id, msg.last_read_at.to_rfc3339()
+                );
+                self.send_to_user(user_id, &payload);
             }
         }
     }
@@ -413,12 +436,11 @@ impl Handler<ReactionEvent> for ChatServer {
         // optimistic broadcast with user_id + emoji (clients will update locally)
         if let Some(members) = self.rooms.get(&msg.room) {
             for user_id in members {
-                if let Some(recipient) = self.sessions.get(user_id) {
-                    recipient.do_send(ServerMessage(format!(
-                        "{{\"type\":\"reaction\",\"room\":\"{}\",\"message_id\":\"{}\",\"emoji\":\"{}\",\"user_id\":\"{}\"}}",
-                        msg.room, msg.message_id, emoji_broadcast, msg.user_id
-                    )));
-                }
+                let payload = format!(
+                    "{{\"type\":\"reaction\",\"room\":\"{}\",\"message_id\":\"{}\",\"emoji\":\"{}\",\"user_id\":\"{}\"}}",
+                    msg.room, msg.message_id, emoji_broadcast, msg.user_id
+                );
+                self.send_to_user(user_id, &payload);
             }
         }
     }
@@ -445,14 +467,13 @@ impl Handler<EditMessage> for ChatServer {
 
         if let Some(members) = self.rooms.get(&msg.room) {
             for user_id in members {
-                if let Some(recipient) = self.sessions.get(user_id) {
-                    recipient.do_send(ServerMessage(format!(
-                        "{{\"type\":\"message_updated\",\"room\":\"{}\",\"message_id\":\"{}\",\"content\":\"{}\"}}",
-                        room,
-                        msg.message_id,
-                        msg.content.replace('\"', "\\\"")
-                    )));
-                }
+                let payload = format!(
+                    "{{\"type\":\"message_updated\",\"room\":\"{}\",\"message_id\":\"{}\",\"content\":\"{}\"}}",
+                    room,
+                    msg.message_id,
+                    msg.content.replace('\"', "\\\"")
+                );
+                self.send_to_user(user_id, &payload);
             }
         }
     }
@@ -477,14 +498,21 @@ impl Handler<DeleteMessage> for ChatServer {
 
         if let Some(members) = self.rooms.get(&msg.room) {
             for user_id in members {
-                if let Some(recipient) = self.sessions.get(user_id) {
-                    recipient.do_send(ServerMessage(format!(
-                        "{{\"type\":\"message_deleted\",\"room\":\"{}\",\"message_id\":\"{}\"}}",
-                        room, msg.message_id
-                    )));
-                }
+                let payload = format!(
+                    "{{\"type\":\"message_deleted\",\"room\":\"{}\",\"message_id\":\"{}\"}}",
+                    room, msg.message_id
+                );
+                self.send_to_user(user_id, &payload);
             }
         }
+    }
+}
+
+impl Handler<InternalNotificationEvent> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: InternalNotificationEvent, _: &mut Context<Self>) {
+        self.send_to_user(&msg.user_id, &msg.payload);
     }
 }
 
@@ -495,8 +523,10 @@ impl ChatServer {
             "{{\"type\":\"presence\",\"user_ids\":{}}}",
             serde_json::to_string(&user_ids).unwrap_or_else(|_| "[]".to_string())
         );
-        for recipient in self.sessions.values() {
-            recipient.do_send(ServerMessage(payload.clone()));
+        for recipients in self.sessions.values() {
+            for recipient in recipients.values() {
+                recipient.do_send(ServerMessage(payload.clone()));
+            }
         }
     }
 }
