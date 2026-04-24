@@ -61,8 +61,10 @@ pub async fn ws_route(
     let session = ChatSession {
         user_id: chat_context.user_id,
         connection_id: Uuid::new_v4(),
-        server_addr: state.chat_server.clone(), 
+        server_addr: state.chat_server.clone(),
         initial_rooms: chat_context.section_rooms,
+        django_base_url: state.django_base_url.clone(),
+        chat_server_token: state.chat_server_token.clone(),
     };
 
     ws::start(session, &req, stream)

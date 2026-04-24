@@ -3,6 +3,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionChannel {
+    Chat,
+    Notifications,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MessageKind {
     Text,
@@ -63,6 +69,7 @@ impl std::fmt::Display for MessageKind {
 pub struct Connect {
     pub user_id: Uuid,
     pub connection_id: Uuid,
+    pub channel: ConnectionChannel,
     pub addr: Recipient<ServerMessage>,
 }
 
@@ -173,4 +180,10 @@ pub struct ErrorMessage {
 pub struct InternalNotificationEvent {
     pub user_id: Uuid,
     pub payload: String,
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct InternalNotificationBatchEvent {
+    pub notifications: Vec<(Uuid, String)>,
 }

@@ -1,7 +1,7 @@
 use actix_web::web::{self, ServiceConfig};
 
 use crate::chat_server::{
-    internal_notifications::publish_notification,
+    internal_notifications::{publish_notification, publish_notifications_bulk},
     ws_handler::{notifications_ws_route, ws_route},
 };
 
@@ -26,6 +26,13 @@ pub fn chat_routes(cfg: &mut ServiceConfig) {
 
         .route("", web::post().to(publish_notification))
         .route("/", web::post().to(publish_notification))
+
+    )
+    .service(
+    web::scope("/internal/notifications/bulk")
+
+        .route("", web::post().to(publish_notifications_bulk))
+        .route("/", web::post().to(publish_notifications_bulk))
 
     );
 }

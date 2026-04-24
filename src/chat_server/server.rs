@@ -15,8 +15,14 @@ use super::persist::{
 };
 use serde::Deserialize;
 
+#[derive(Clone)]
+pub struct SessionConnection {
+    pub channel: ConnectionChannel,
+    pub recipient: Recipient<ServerMessage>,
+}
+
 pub struct ChatServer {
-    pub sessions: HashMap<Uuid, HashMap<Uuid, Recipient<ServerMessage>>>,
+    pub sessions: HashMap<Uuid, HashMap<Uuid, SessionConnection>>,
     pub rooms: HashMap<String, HashSet<Uuid>>,
     pub django_base_url: String,
     pub chat_server_token: String,
@@ -74,12 +80,33 @@ impl ChatServer {
         }
     }
 
-    fn send_to_user(&self, user_id: &Uuid, payload: &str) {
+    fn send_to_channel(&self, user_id: &Uuid, payload: &str, channel: ConnectionChannel) {
         if let Some(recipients) = self.sessions.get(user_id) {
             for recipient in recipients.values() {
-                recipient.do_send(ServerMessage(payload.to_string()));
+                if recipient.channel == channel {
+                    recipient.recipient.do_send(ServerMessage(payload.to_string()));
+                }
             }
         }
+    }
+
+    fn send_to_chat(&self, user_id: &Uuid, payload: &str) {
+        self.send_to_channel(user_id, payload, ConnectionChannel::Chat);
+    }
+
+    fn send_to_notifications(&self, user_id: &Uuid, payload: &str) {
+        self.send_to_channel(user_id, payload, ConnectionChannel::Notifications);
+    }
+
+    fn chat_recipients_for_room(&self, room: &str) -> Vec<Recipient<ServerMessage>> {
+        self.rooms
+            .get(room)
+            .into_iter()
+            .flat_map(|members| members.iter())
+            .flat_map(|uid| self.sessions.get(uid).into_iter().flat_map(|conns| conns.values()))
+            .filter(|connection| connection.channel == ConnectionChannel::Chat)
+            .map(|connection| connection.recipient.clone())
+            .collect()
     }
 }
 
@@ -95,8 +122,16 @@ impl Handler<Connect> for ChatServer {
         self.sessions
             .entry(msg.user_id)
             .or_default()
-            .insert(msg.connection_id, msg.addr);
-        self.broadcast_presence();
+            .insert(
+                msg.connection_id,
+                SessionConnection {
+                    channel: msg.channel,
+                    recipient: msg.addr,
+                },
+            );
+        if msg.channel == ConnectionChannel::Chat {
+            self.broadcast_presence();
+        }
     }
 }
 
@@ -105,23 +140,25 @@ impl Handler<Disconnect> for ChatServer {
 
     fn handle(&mut self, msg: Disconnect, _: &mut Context<Self>) {
         println!("User disconnected: {}", msg.user_id);
-        let should_remove = if let Some(connections) = self.sessions.get_mut(&msg.user_id) {
-            connections.remove(&msg.connection_id);
-            connections.is_empty()
+        let removed_channel = if let Some(connections) = self.sessions.get_mut(&msg.user_id) {
+            let removed = connections.remove(&msg.connection_id).map(|connection| connection.channel);
+            let should_remove = connections.is_empty();
+            if should_remove {
+                self.sessions.remove(&msg.user_id);
+            }
+            removed
         } else {
-            false
+            None
         };
-
-        if should_remove {
-            self.sessions.remove(&msg.user_id);
-        }
 
         if !self.sessions.contains_key(&msg.user_id) {
             for members in self.rooms.values_mut() {
                 members.remove(&msg.user_id);
             }
         }
-        self.broadcast_presence();
+        if removed_channel == Some(ConnectionChannel::Chat) {
+            self.broadcast_presence();
+        }
     }
 }
 
@@ -137,8 +174,8 @@ impl Handler<DirectMessage> for ChatServer {
         let client = self.http_client.clone();
         let members_payload: Vec<String> = members.iter().map(|id| id.to_string()).collect();
         let room_clone = room.clone();
-        let sessions = self.sessions.clone();
-        let room_members = self.rooms.get(&room).cloned().unwrap_or_default();
+        // Bug 3 fix: only clone recipients for room members, not the entire sessions map
+        let recipients_snapshot = self.chat_recipients_for_room(&room);
         let reply_to_id = msg.reply_to_id.map(|id| id.to_string());
         let reply_to_content = msg.reply_to_content.clone();
         let reply_to_sender = msg.reply_to_sender.clone();
@@ -188,23 +225,19 @@ impl Handler<DirectMessage> for ChatServer {
                 .map(|value| format!(",\"reply_to_id\":\"{}\"", value))
                 .unwrap_or_default();
 
-            for user_id in room_members {
-                if let Some(recipients) = sessions.get(&user_id) {
-                    for recipient in recipients.values() {
-                        recipient.do_send(ServerMessage(format!(
-                            "{{\"type\":\"direct\",\"room\":\"{}\",\"from\":\"{}\",\"content\":\"{}\",\"kind\":\"{}\",\"sent_at\":\"{}\",\"message_id\":\"{}\"{}{}{} }}",
-                            room_clone,
-                            from,
-                            content.replace('"', "\\\""),
-                            kind,
-                            sent_at,
-                            message_id,
-                            reply_id_part,
-                            reply_content_part,
-                            reply_sender_part
-                        )));
-                    }
-                }
+            for recipient in recipients_snapshot {
+                recipient.do_send(ServerMessage(format!(
+                    "{{\"type\":\"direct\",\"room\":\"{}\",\"from\":\"{}\",\"content\":\"{}\",\"kind\":\"{}\",\"sent_at\":\"{}\",\"message_id\":\"{}\"{}{}{}}}",
+                    room_clone,
+                    from,
+                    content.replace('"', "\\\""),
+                    kind,
+                    sent_at,
+                    message_id,
+                    reply_id_part,
+                    reply_content_part,
+                    reply_sender_part
+                )));
             }
         });
     }
@@ -214,6 +247,15 @@ impl Handler<GroupMessage> for ChatServer {
     type Result = ();
 
     fn handle(&mut self, msg: GroupMessage, _: &mut Context<Self>) {
+        // Bug 2 fix: check room existence BEFORE spawning the async task
+        if !self.rooms.contains_key(&msg.room) {
+            let payload = format!(
+                "{{\"type\":\"error\",\"code\":\"ROOM_NOT_FOUND\",\"message\":\"Room {} does not exist or you have not joined it\"}}",
+                msg.room
+            );
+            self.send_to_chat(&msg.from, &payload);
+            return;
+        }
         let room_type = if msg.room.starts_with("section:") {
             "section"
         } else {
@@ -224,8 +266,8 @@ impl Handler<GroupMessage> for ChatServer {
         let token = self.chat_server_token.clone();
         let client = self.http_client.clone();
         let room_clone = msg.room.clone();
-        let sessions = self.sessions.clone();
-        let room_members = self.rooms.get(&msg.room).cloned().unwrap_or_default();
+        // Bug 3 fix: only clone recipients for room members
+        let recipients_snapshot = self.chat_recipients_for_room(&msg.room);
         let reply_to_id = msg.reply_to_id.map(|id| id.to_string());
         let reply_to_content = msg.reply_to_content.clone();
         let reply_to_sender = msg.reply_to_sender.clone();
@@ -275,34 +317,21 @@ impl Handler<GroupMessage> for ChatServer {
                 .map(|value| format!(",\"reply_to_id\":\"{}\"", value))
                 .unwrap_or_default();
 
-            for user_id in room_members {
-                if let Some(recipients) = sessions.get(&user_id) {
-                    for recipient in recipients.values() {
-                        recipient.do_send(ServerMessage(format!(
-                            "{{\"type\":\"group\",\"room\":\"{}\",\"from\":\"{}\",\"content\":\"{}\",\"kind\":\"{}\",\"sent_at\":\"{}\",\"message_id\":\"{}\"{}{}{} }}",
-                            room_clone,
-                            from,
-                            content.replace('"', "\\\""),
-                            kind,
-                            sent_at,
-                            message_id,
-                            reply_id_part,
-                            reply_content_part,
-                            reply_sender_part
-                        )));
-                    }
-                }
+            for recipient in recipients_snapshot {
+                recipient.do_send(ServerMessage(format!(
+                    "{{\"type\":\"group\",\"room\":\"{}\",\"from\":\"{}\",\"content\":\"{}\",\"kind\":\"{}\",\"sent_at\":\"{}\",\"message_id\":\"{}\"{}{}{}}}",
+                    room_clone,
+                    from,
+                    content.replace('"', "\\\""),
+                    kind,
+                    sent_at,
+                    message_id,
+                    reply_id_part,
+                    reply_content_part,
+                    reply_sender_part
+                )));
             }
         });
-
-        if !self.rooms.contains_key(&msg.room) {
-            // Notify sender that room does not exist
-            let payload = format!(
-                "{{\"type\":\"error\",\"code\":\"ROOM_NOT_FOUND\",\"message\":\"Room {} does not exist or you have not joined it\"}}",
-                msg.room
-            );
-            self.send_to_user(&msg.from, &payload);
-        }
     }
 }
 
@@ -345,7 +374,7 @@ impl Handler<TypingEvent> for ChatServer {
                     "{{\"type\":\"typing\",\"room\":\"{}\",\"user_id\":\"{}\",\"is_typing\":{}}}",
                     msg.room, msg.user_id, msg.is_typing
                 );
-                self.send_to_user(user_id, &payload);
+                self.send_to_chat(user_id, &payload);
             }
         }
     }
@@ -370,7 +399,7 @@ impl Handler<ReadEvent> for ChatServer {
                     "{{\"type\":\"read\",\"room\":\"{}\",\"user_id\":\"{}\",\"last_read_at\":\"{}\"}}",
                     msg.room, msg.user_id, msg.last_read_at.to_rfc3339()
                 );
-                self.send_to_user(user_id, &payload);
+                self.send_to_chat(user_id, &payload);
             }
         }
     }
@@ -398,6 +427,9 @@ impl Handler<ReactionEvent> for ChatServer {
         let user_id = msg.user_id;
         let emoji = msg.emoji.clone();
         let emoji_broadcast = emoji.clone();
+        // Bug 1 fix: snapshot recipients so the spawn can broadcast the authoritative reactions
+        let reaction_recipients = self.chat_recipients_for_room(&msg.room);
+
         actix::spawn(async move {
             let payload = PersistReactionPayload {
                 message_id: msg.message_id.to_string(),
@@ -413,36 +445,29 @@ impl Handler<ReactionEvent> for ChatServer {
             .await
             {
                 Ok(response) => {
+                    // Bug 1 fix: actually broadcast the authoritative reactions from Django
                     let reactions_json = response.reactions.to_string();
-                    let message_id = response.message_id;
-                    let room_payload = room.clone();
                     let server_message = format!(
                         "{{\"type\":\"reaction\",\"room\":\"{}\",\"message_id\":\"{}\",\"reactions\":{}}}",
-                        room_payload, message_id, reactions_json
+                        room, response.message_id, reactions_json
                     );
-                    // broadcast using a separate task since we don't have server state here
-                    // note: reaction broadcast is best-effort; clients can refetch on refresh
-                    // This closure cannot access ChatServer sessions; handled below by internal send
-                    // (see fallback path).
-                    // This is a no-op placeholder.
-                    let _ = server_message;
+                    for recipient in reaction_recipients {
+                        recipient.do_send(ServerMessage(server_message.clone()));
+                    }
                 }
                 Err(error) => {
                     eprintln!("Failed to persist reaction: {error}");
+                    // fallback: optimistic broadcast so UI isn't stuck
+                    let fallback = format!(
+                        "{{\"type\":\"reaction\",\"room\":\"{}\",\"message_id\":\"{}\",\"emoji\":\"{}\",\"user_id\":\"{}\"}}",
+                        room, msg.message_id, emoji_broadcast, user_id
+                    );
+                    for recipient in reaction_recipients {
+                        recipient.do_send(ServerMessage(fallback.clone()));
+                    }
                 }
             }
         });
-
-        // optimistic broadcast with user_id + emoji (clients will update locally)
-        if let Some(members) = self.rooms.get(&msg.room) {
-            for user_id in members {
-                let payload = format!(
-                    "{{\"type\":\"reaction\",\"room\":\"{}\",\"message_id\":\"{}\",\"emoji\":\"{}\",\"user_id\":\"{}\"}}",
-                    msg.room, msg.message_id, emoji_broadcast, msg.user_id
-                );
-                self.send_to_user(user_id, &payload);
-            }
-        }
     }
 }
 
@@ -473,7 +498,7 @@ impl Handler<EditMessage> for ChatServer {
                     msg.message_id,
                     msg.content.replace('\"', "\\\"")
                 );
-                self.send_to_user(user_id, &payload);
+                self.send_to_chat(user_id, &payload);
             }
         }
     }
@@ -502,7 +527,7 @@ impl Handler<DeleteMessage> for ChatServer {
                     "{{\"type\":\"message_deleted\",\"room\":\"{}\",\"message_id\":\"{}\"}}",
                     room, msg.message_id
                 );
-                self.send_to_user(user_id, &payload);
+                self.send_to_chat(user_id, &payload);
             }
         }
     }
@@ -512,7 +537,17 @@ impl Handler<InternalNotificationEvent> for ChatServer {
     type Result = ();
 
     fn handle(&mut self, msg: InternalNotificationEvent, _: &mut Context<Self>) {
-        self.send_to_user(&msg.user_id, &msg.payload);
+        self.send_to_notifications(&msg.user_id, &msg.payload);
+    }
+}
+
+impl Handler<InternalNotificationBatchEvent> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: InternalNotificationBatchEvent, _: &mut Context<Self>) {
+        for (user_id, payload) in msg.notifications {
+            self.send_to_notifications(&user_id, &payload);
+        }
     }
 }
 
@@ -525,7 +560,9 @@ impl ChatServer {
         );
         for recipients in self.sessions.values() {
             for recipient in recipients.values() {
-                recipient.do_send(ServerMessage(payload.clone()));
+                if recipient.channel == ConnectionChannel::Chat {
+                    recipient.recipient.do_send(ServerMessage(payload.clone()));
+                }
             }
         }
     }

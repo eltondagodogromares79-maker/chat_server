@@ -4,6 +4,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use uuid::Uuid;
 
+use super::auth::validate_room_access;
 use super::message::*;
 use super::server::ChatServer;
 
@@ -12,6 +13,8 @@ pub struct ChatSession {
     pub connection_id: Uuid,
     pub server_addr: Addr<ChatServer>,
     pub initial_rooms: Vec<String>,
+    pub django_base_url: String,
+    pub chat_server_token: String,
 }
 
 #[derive(Deserialize)]
@@ -75,6 +78,7 @@ impl Actor for ChatSession {
         self.server_addr.do_send(Connect {
             user_id: self.user_id,
             connection_id: self.connection_id,
+            channel: ConnectionChannel::Chat,
             addr: addr.recipient(),
         });
 
@@ -167,16 +171,44 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for ChatSession {
                             ctx.text("{\"type\":\"error\",\"code\":\"INVALID_ROOM\",\"message\":\"Room name cannot be empty\"}");
                             return;
                         }
+                        let user_id = self.user_id;
+                        let server_addr = self.server_addr.clone();
+                        let django_base_url = self.django_base_url.clone();
+                        let chat_server_token = self.chat_server_token.clone();
+                        let room_clone = room.clone();
 
-                        self.server_addr.do_send(JoinRoom {
-                            user_id: self.user_id,
-                            room: room.clone(),
-                        });
-
-                        ctx.text(format!(
-                            "{{\"type\":\"joined\",\"room\":\"{}\"}}",
-                            room
-                        ));
+                        ctx.spawn(
+                            actix::fut::wrap_future(async move {
+                                validate_room_access(
+                                    &django_base_url,
+                                    &chat_server_token,
+                                    user_id,
+                                    &room_clone,
+                                )
+                                .await
+                            })
+                            .map(move |result, _actor, ctx: &mut ws::WebsocketContext<Self>| match result {
+                                Ok(true) => {
+                                    server_addr.do_send(JoinRoom {
+                                        user_id,
+                                        room: room.clone(),
+                                    });
+                                    ctx.text(format!(
+                                        "{{\"type\":\"joined\",\"room\":\"{}\"}}",
+                                        room
+                                    ));
+                                }
+                                Ok(false) => {
+                                    ctx.text(format!(
+                                        "{{\"type\":\"error\",\"code\":\"ROOM_FORBIDDEN\",\"message\":\"You do not have access to room {}\"}}",
+                                        room
+                                    ));
+                                }
+                                Err(_) => {
+                                    ctx.text("{\"type\":\"error\",\"code\":\"ROOM_VALIDATION_FAILED\",\"message\":\"Unable to verify room access\"}");
+                                }
+                            }),
+                        );
                     }
 
                     Ok(ClientMessage::CreateGroup { room }) => {

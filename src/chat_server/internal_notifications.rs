@@ -4,12 +4,17 @@ use uuid::Uuid;
 
 use crate::state::AppState;
 
-use super::message::InternalNotificationEvent;
+use super::message::{InternalNotificationBatchEvent, InternalNotificationEvent};
 
 #[derive(Deserialize)]
 pub struct InternalNotificationRequest {
     pub user_id: Uuid,
     pub payload: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+pub struct InternalNotificationBatchRequest {
+    pub events: Vec<InternalNotificationRequest>,
 }
 
 fn is_authorized(req: &HttpRequest, expected_token: &str) -> bool {
@@ -40,6 +45,28 @@ pub async fn publish_notification(
         user_id: payload.user_id,
         payload: payload.payload.to_string(),
     });
+
+    HttpResponse::Accepted().finish()
+}
+
+pub async fn publish_notifications_bulk(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    payload: web::Json<InternalNotificationBatchRequest>,
+) -> HttpResponse {
+    if !is_authorized(&req, &state.chat_server_token) {
+        return HttpResponse::Unauthorized().finish();
+    }
+
+    let notifications = payload
+        .events
+        .iter()
+        .map(|event| (event.user_id, event.payload.to_string()))
+        .collect();
+
+    state
+        .chat_server
+        .do_send(InternalNotificationBatchEvent { notifications });
 
     HttpResponse::Accepted().finish()
 }

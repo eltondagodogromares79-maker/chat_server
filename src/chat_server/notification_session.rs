@@ -19,6 +19,7 @@ impl Actor for NotificationSession {
         self.server_addr.do_send(Connect {
             user_id: self.user_id,
             connection_id: self.connection_id,
+            channel: ConnectionChannel::Notifications,
             addr: addr.recipient(),
         });
         ctx.text(format!(

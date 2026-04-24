@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde::Deserialize;
+use url::form_urlencoded;
 use uuid::Uuid;
 
 #[derive(Deserialize)]
@@ -14,6 +15,11 @@ struct DjangoChatContext {
     id: String,
     role: String,
     sections: Vec<DjangoSection>,
+}
+
+#[derive(Deserialize)]
+struct DjangoRoomAccess {
+    allowed: bool,
 }
 
 pub struct ChatContext {
@@ -55,4 +61,34 @@ pub async fn resolve_chat_context(
         role: profile.role,
         section_rooms,
     })
+}
+
+pub async fn validate_room_access(
+    django_base_url: &str,
+    token: &str,
+    user_id: Uuid,
+    room_key: &str,
+) -> Result<bool> {
+    let client = Client::new();
+    let query = form_urlencoded::Serializer::new(String::new())
+        .append_pair("room_key", room_key)
+        .append_pair("user_id", &user_id.to_string())
+        .finish();
+    let url = format!(
+        "{}/api/chat/rooms/access/?{}",
+        django_base_url.trim_end_matches('/'),
+        query
+    );
+    let response = client
+        .get(url)
+        .header("X-Chat-Server-Token", token)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(anyhow!("Room access lookup failed"));
+    }
+
+    let payload: DjangoRoomAccess = response.json().await?;
+    Ok(payload.allowed)
 }
