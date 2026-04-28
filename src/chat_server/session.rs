@@ -2,6 +2,7 @@ use actix::prelude::*;
 use actix_web_actors::ws;
 use chrono::Utc;
 use serde::Deserialize;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use super::auth::validate_room_access;
@@ -15,6 +16,22 @@ pub struct ChatSession {
     pub initial_rooms: Vec<String>,
     pub django_base_url: String,
     pub chat_server_token: String,
+    pub hb: Instant,
+}
+
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(45);
+
+impl ChatSession {
+    fn start_heartbeat(&self, ctx: &mut ws::WebsocketContext<Self>) {
+        ctx.run_interval(HEARTBEAT_INTERVAL, |actor, ctx| {
+            if Instant::now().duration_since(actor.hb) > CLIENT_TIMEOUT {
+                ctx.stop();
+                return;
+            }
+            ctx.ping(b"");
+        });
+    }
 }
 
 #[derive(Deserialize)]
@@ -73,6 +90,7 @@ impl Actor for ChatSession {
     type Context = ws::WebsocketContext<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
+        self.start_heartbeat(ctx);
         let addr = ctx.address();
 
         self.server_addr.do_send(Connect {
@@ -349,7 +367,12 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for ChatSession {
             }
 
             Ok(ws::Message::Ping(msg)) => {
+                self.hb = Instant::now();
                 ctx.pong(&msg);
+            }
+
+            Ok(ws::Message::Pong(_)) => {
+                self.hb = Instant::now();
             }
 
             Ok(ws::Message::Close(reason)) => {

@@ -1,5 +1,6 @@
 use actix::prelude::*;
 use actix_web_actors::ws;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use super::message::*;
@@ -9,12 +10,29 @@ pub struct NotificationSession {
     pub user_id: Uuid,
     pub connection_id: Uuid,
     pub server_addr: Addr<ChatServer>,
+    pub hb: Instant,
+}
+
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(45);
+
+impl NotificationSession {
+    fn start_heartbeat(&self, ctx: &mut ws::WebsocketContext<Self>) {
+        ctx.run_interval(HEARTBEAT_INTERVAL, |actor, ctx| {
+            if Instant::now().duration_since(actor.hb) > CLIENT_TIMEOUT {
+                ctx.stop();
+                return;
+            }
+            ctx.ping(b"");
+        });
+    }
 }
 
 impl Actor for NotificationSession {
     type Context = ws::WebsocketContext<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
+        self.start_heartbeat(ctx);
         let addr = ctx.address();
         self.server_addr.do_send(Connect {
             user_id: self.user_id,
@@ -51,7 +69,13 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for NotificationSessi
         ctx: &mut Self::Context,
     ) {
         match msg {
-            Ok(ws::Message::Ping(payload)) => ctx.pong(&payload),
+            Ok(ws::Message::Ping(payload)) => {
+                self.hb = Instant::now();
+                ctx.pong(&payload);
+            }
+            Ok(ws::Message::Pong(_)) => {
+                self.hb = Instant::now();
+            }
             Ok(ws::Message::Close(reason)) => {
                 ctx.close(reason);
                 ctx.stop();

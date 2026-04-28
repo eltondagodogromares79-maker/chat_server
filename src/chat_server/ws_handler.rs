@@ -1,5 +1,6 @@
 use actix_web::{web, HttpRequest, HttpResponse};
 use actix_web_actors::ws;
+use std::time::Instant;
 use uuid::Uuid;
 use crate::state::AppState;
 
@@ -65,6 +66,7 @@ pub async fn ws_route(
         initial_rooms: chat_context.section_rooms,
         django_base_url: state.django_base_url.clone(),
         chat_server_token: state.chat_server_token.clone(),
+        hb: Instant::now(),
     };
 
     ws::start(session, &req, stream)
@@ -84,6 +86,7 @@ pub async fn notifications_ws_route(
         user_id: chat_context.user_id,
         connection_id: Uuid::new_v4(),
         server_addr: state.chat_server.clone(),
+        hb: Instant::now(),
     };
 
     ws::start(session, &req, stream)

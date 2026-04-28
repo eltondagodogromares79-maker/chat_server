@@ -108,6 +108,17 @@ impl ChatServer {
             .map(|connection| connection.recipient.clone())
             .collect()
     }
+
+    fn has_chat_connection(&self, user_id: &Uuid) -> bool {
+        self.sessions
+            .get(user_id)
+            .map(|connections| {
+                connections
+                    .values()
+                    .any(|connection| connection.channel == ConnectionChannel::Chat)
+            })
+            .unwrap_or(false)
+    }
 }
 
 impl Actor for ChatServer {
@@ -151,7 +162,7 @@ impl Handler<Disconnect> for ChatServer {
             None
         };
 
-        if !self.sessions.contains_key(&msg.user_id) {
+        if !self.has_chat_connection(&msg.user_id) {
             for members in self.rooms.values_mut() {
                 members.remove(&msg.user_id);
             }
@@ -553,7 +564,16 @@ impl Handler<InternalNotificationBatchEvent> for ChatServer {
 
 impl ChatServer {
     fn broadcast_presence(&self) {
-        let user_ids: Vec<String> = self.sessions.keys().map(|id| id.to_string()).collect();
+        let user_ids: Vec<String> = self
+            .sessions
+            .iter()
+            .filter_map(|(user_id, connections)| {
+                connections
+                    .values()
+                    .any(|connection| connection.channel == ConnectionChannel::Chat)
+                    .then(|| user_id.to_string())
+            })
+            .collect();
         let payload = format!(
             "{{\"type\":\"presence\",\"user_ids\":{}}}",
             serde_json::to_string(&user_ids).unwrap_or_else(|_| "[]".to_string())
